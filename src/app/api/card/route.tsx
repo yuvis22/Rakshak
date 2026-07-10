@@ -4,36 +4,37 @@ import type { RiskLevel } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const THEME: Record<RiskLevel, { color: string; label: string; emoji: string }> = {
-  safe: { color: "#2fd27a", label: "LIKELY SAFE", emoji: "✓" },
-  suspicious: { color: "#f5b400", label: "SUSPICIOUS", emoji: "!" },
-  scam: { color: "#ff5470", label: "SCAM ALERT", emoji: "✕" },
+const COLORS: Record<RiskLevel, { accent: string; label: string; emoji: string }> = {
+  safe: { accent: "#2fd27a", label: "SAFE", emoji: "✓" },
+  suspicious: { accent: "#f5b400", label: "SUSPICIOUS", emoji: "!" },
+  scam: { accent: "#ff5470", label: "SCAM", emoji: "✕" },
 };
 
 /**
- * Generates a shareable warning-card PNG (1080x1080) from a verdict.
- * Designed to be forwarded back into WhatsApp/family groups — the awareness
- * loop that makes Rakshak spread.
+ * Generates a shareable warning-card PNG (1080x1080) for a verdict, so users
+ * can forward the result back into WhatsApp/family groups — the awareness loop.
  */
 export async function POST(req: Request) {
-  let data: {
+  let body: {
     risk_level?: RiskLevel;
     headline?: string;
     confidence?: number;
     red_flags?: string[];
     models?: number;
-    matched?: string;
+    match?: string;
   };
   try {
-    data = await req.json();
+    body = await req.json();
   } catch {
     return new Response("Invalid body", { status: 400 });
   }
 
-  const risk: RiskLevel = data.risk_level ?? "suspicious";
-  const t = THEME[risk];
-  const flags = (data.red_flags ?? []).slice(0, 3);
-  const confidence = Math.round(data.confidence ?? 0);
+  const risk: RiskLevel = body.risk_level ?? "suspicious";
+  const c = COLORS[risk];
+  const headline = (body.headline ?? "").slice(0, 120);
+  const flags = (body.red_flags ?? []).slice(0, 3);
+  const confidence = Math.round(body.confidence ?? 0);
+  const models = body.models ?? 0;
 
   return new ImageResponse(
     (
@@ -46,87 +47,77 @@ export async function POST(req: Request) {
           background: "#07080c",
           padding: "72px",
           fontFamily: "sans-serif",
+          color: "#e9eaf0",
         }}
       >
         {/* header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
-            <div
-              style={{
-                width: "64px",
-                height: "64px",
-                borderRadius: "16px",
-                background: "#7c5cff",
-                color: "#07080c",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: "40px",
-                fontWeight: 700,
-              }}
-            >
-              र
-            </div>
-            <div style={{ display: "flex", flexDirection: "column" }}>
-              <span style={{ color: "#e9eaf0", fontSize: "34px", fontWeight: 700 }}>Rakshak</span>
-              <span style={{ color: "#8b90a3", fontSize: "20px", letterSpacing: "4px" }}>SCAM SHIELD</span>
-            </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <div
+            style={{
+              width: "56px",
+              height: "56px",
+              borderRadius: "14px",
+              background: "#7c5cff",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "34px",
+              fontWeight: 700,
+              color: "#07080c",
+            }}
+          >
+            र
           </div>
-          <span style={{ color: "#8b90a3", fontSize: "22px" }}>checked via Mesh AI</span>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <span style={{ fontSize: "34px", fontWeight: 700 }}>Rakshak</span>
+            <span style={{ fontSize: "20px", color: "#8b90a3", letterSpacing: "3px" }}>SCAM SHIELD</span>
+          </div>
         </div>
 
-        {/* risk badge */}
+        {/* verdict badge */}
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: "24px",
-            marginTop: "80px",
+            gap: "28px",
+            marginTop: "90px",
           }}
         >
           <div
             style={{
-              width: "120px",
-              height: "120px",
-              borderRadius: "60px",
-              background: t.color,
+              width: "150px",
+              height: "150px",
+              borderRadius: "50%",
+              background: c.accent,
               color: "#07080c",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              fontSize: "72px",
-              fontWeight: 700,
+              fontSize: "96px",
+              fontWeight: 800,
             }}
           >
-            {t.emoji}
+            {c.emoji}
           </div>
           <div style={{ display: "flex", flexDirection: "column" }}>
-            <span style={{ color: t.color, fontSize: "64px", fontWeight: 700, letterSpacing: "2px" }}>
-              {t.label}
+            <span style={{ fontSize: "96px", fontWeight: 800, color: c.accent, lineHeight: 1 }}>{c.label}</span>
+            <span style={{ fontSize: "34px", color: "#8b90a3", marginTop: "12px" }}>
+              {confidence}% confidence · {models} AI models
             </span>
-            <span style={{ color: "#8b90a3", fontSize: "28px" }}>{confidence}% confidence</span>
           </div>
         </div>
 
         {/* headline */}
-        <div
-          style={{
-            display: "flex",
-            marginTop: "48px",
-            color: "#e9eaf0",
-            fontSize: "40px",
-            lineHeight: 1.3,
-          }}
-        >
-          {(data.headline ?? "").slice(0, 140)}
+        <div style={{ display: "flex", marginTop: "56px", fontSize: "44px", fontWeight: 600, lineHeight: 1.25 }}>
+          {headline}
         </div>
 
-        {/* red flags */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "18px", marginTop: "48px" }}>
+        {/* flags */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "18px", marginTop: "44px" }}>
           {flags.map((f, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: "14px" }}>
-              <span style={{ color: t.color, fontSize: "30px" }}>▸</span>
-              <span style={{ color: "#c9ccd6", fontSize: "28px", lineHeight: 1.35 }}>{f.slice(0, 110)}</span>
+            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: "16px", fontSize: "30px", color: "#c7cad6" }}>
+              <span style={{ color: c.accent }}>▸</span>
+              <span>{f.slice(0, 90)}</span>
             </div>
           ))}
         </div>
@@ -136,16 +127,16 @@ export async function POST(req: Request) {
           style={{
             display: "flex",
             marginTop: "auto",
-            paddingTop: "40px",
-            borderTop: "2px solid #1e2230",
             justifyContent: "space-between",
             alignItems: "center",
+            borderTop: "1px solid #1e2230",
+            paddingTop: "32px",
+            fontSize: "26px",
+            color: "#8b90a3",
           }}
         >
-          <span style={{ color: "#8b90a3", fontSize: "24px" }}>
-            {data.matched ? `Matches: ${data.matched}` : "Never share OTP / PIN / passwords"}
-          </span>
-          <span style={{ color: "#8b90a3", fontSize: "24px" }}>Report fraud → 1930</span>
+          <span>Checked across multiple AI models via Mesh API</span>
+          <span>Report fraud → 1930</span>
         </div>
       </div>
     ),

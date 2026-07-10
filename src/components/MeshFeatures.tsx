@@ -6,6 +6,7 @@ const LABELS: Record<string, string> = {
   "auto-routing": "Auto-Routing",
   "web-search": "Web Search",
   vision: "Vision",
+  "speech-to-text": "Speech-to-Text",
   tts: "Text-to-Speech",
 };
 

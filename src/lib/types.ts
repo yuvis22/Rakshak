@@ -90,11 +90,18 @@ export interface UsageEvent {
   cost_usd: number | null;
 }
 
+/** Server-sent events emitted while an analysis runs (streaming endpoint). */
+export type StreamEvent =
+  | { type: "stage"; stage: string; label: string }
+  | { type: "opinion"; opinion: ModelOpinion }
+  | { type: "result"; result: AnalysisResult }
+  | { type: "error"; message: string };
+
 /** Full analysis response returned by /api/analyze. */
 export interface AnalysisResult {
   mode: Mode;
   mock: boolean;
-  source: "text" | "image"; // whether input came from a screenshot (vision)
+  source: "text" | "image" | "audio"; // text, screenshot (vision), or voice note (STT)
   signal: ScamSignal;
   matches: ScamMatch[];
   retrieval: RetrievalInfo;

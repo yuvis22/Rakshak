@@ -245,6 +245,32 @@ export async function webSearch(params: {
   };
 }
 
+/** Mesh Speech-to-Text — transcribe an audio data-URL to text (multipart upload). */
+export async function transcribe(dataUrl: string, model: string): Promise<string> {
+  const comma = dataUrl.indexOf(",");
+  const meta = dataUrl.slice(0, comma);
+  const b64 = dataUrl.slice(comma + 1);
+  const mime = meta.match(/data:(.*?);base64/)?.[1] ?? "audio/webm";
+  const ext = mime.split("/")[1]?.split(";")[0] ?? "webm";
+  const bytes = Buffer.from(b64, "base64");
+
+  const form = new FormData();
+  form.append("model", model);
+  form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), `audio.${ext}`);
+
+  const res = await fetch(`${BASE_URL}/audio/transcriptions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${API_KEY}` }, // let fetch set the multipart boundary
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new MeshError(res.status, text || res.statusText);
+  }
+  const data = await res.json();
+  return (data?.text ?? "").trim();
+}
+
 /** Mesh Text-to-Speech — returns raw audio bytes (mp3). */
 export async function speak(params: {
   input: string;

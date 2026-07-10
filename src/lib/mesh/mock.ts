@@ -5,10 +5,14 @@ import type {
   RiskLevel,
   ScamMatch,
   ScamSignal,
+  StreamEvent,
   Verdict,
 } from "@/lib/types";
 import { basePlan } from "./models";
 import { retrieve } from "@/lib/knowledge/retrieval";
+import { detectInjection } from "@/lib/security";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Heuristic mock engine. Runs when no Mesh key is configured so the whole app
@@ -142,13 +146,27 @@ function makeVerdict(signal: ScamSignal, level: RiskLevel, score: number, flags:
 
 const MOCK_MODELS = ["mock/fast-8b", "mock/reasoner", "mock/multilingual"];
 
-export async function mockAnalyze(text: string, mode: Mode): Promise<AnalysisResult> {
+export async function mockAnalyze(
+  text: string,
+  mode: Mode,
+  emit?: (ev: StreamEvent) => void,
+): Promise<AnalysisResult> {
   const started = Date.now();
+  const stage = async (s: string, label: string, ms = 260) => {
+    if (!emit) return;
+    emit({ type: "stage", stage: s, label });
+    await sleep(ms);
+  };
+
+  await stage("retrieve", "Matching against known scam patterns…");
   const signal = buildSignal(text);
 
   // RAG: retrieve closest known scams and let a strong match refine the score.
   const retrieval = await retrieve(text);
   const topMatch: ScamMatch | undefined = retrieval.matches[0];
+
+  await stage("route", "Selecting triage model…", 200);
+  await stage("extract", "Extracting structured signal…", 220);
 
   const base = scoreRisk(signal, text);
   const ragBoost = topMatch ? Math.round((topMatch.similarity / 100) * 40) : 0;
@@ -161,11 +179,11 @@ export async function mockAnalyze(text: string, mode: Mode): Promise<AnalysisRes
   if (topMatch && topMatch.similarity >= 40) {
     flags.unshift(`Matches a known "${topMatch.name}" (${topMatch.similarity}% similar to reported cases).`);
   }
-  const level: RiskLevel = score >= 60 ? "scam" : score >= 30 ? "suspicious" : "safe";
-  const verdict = makeVerdict(signal, level, score, flags);
-  if (topMatch && topMatch.similarity >= 40 && level !== "safe") {
-    verdict.explanation += ` This closely resembles the "${topMatch.name}" pattern. ${topMatch.advice}`;
+  if (detectInjection(text)) {
+    score = Math.min(98, score + 10);
+    flags.unshift("Contains prompt-injection style text trying to manipulate an AI checker — a manipulation red flag.");
   }
+  const level: RiskLevel = score >= 60 ? "scam" : score >= 30 ? "suspicious" : "safe";
 
   // Simulate three models with slightly varied confidence to populate the panel.
   const opinions: ModelOpinion[] = MOCK_MODELS.map((m, i) => ({
@@ -179,6 +197,21 @@ export async function mockAnalyze(text: string, mode: Mode): Promise<AnalysisRes
     latency_ms: 200 + i * 90,
     error: null,
   }));
+
+  // Stream each model's opinion into the panel (simulated timing offline).
+  await stage("consensus", "Asking multiple models in parallel…", 200);
+  if (emit) {
+    for (const op of opinions) {
+      emit({ type: "opinion", opinion: op });
+      await sleep(240);
+    }
+  }
+
+  await stage("verdict", "Synthesizing the final verdict…", 220);
+  const verdict = makeVerdict(signal, level, score, flags);
+  if (topMatch && topMatch.similarity >= 40 && level !== "safe") {
+    verdict.explanation += ` This closely resembles the "${topMatch.name}" pattern. ${topMatch.advice}`;
+  }
 
   const plan = basePlan(mode);
   return {
