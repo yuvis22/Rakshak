@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import type { AnalysisResult, Mode } from "@/lib/types";
+import type { AnalysisResult, Mode, ModelOpinion, StreamEvent } from "@/lib/types";
+import { StreamProgress } from "@/components/StreamProgress";
 import { VerdictCard } from "@/components/VerdictCard";
 import { ModelPanel } from "@/components/ModelPanel";
 import { OrchestrationPanel } from "@/components/OrchestrationPanel";
@@ -9,6 +10,7 @@ import { MatchPanel } from "@/components/MatchPanel";
 import { IntelPanel } from "@/components/IntelPanel";
 import { MeshFeatures } from "@/components/MeshFeatures";
 import { ListenButton } from "@/components/ListenButton";
+import { ShareButton } from "@/components/ShareButton";
 
 const DEFAULT_MODE: Mode = process.env.NEXT_PUBLIC_DEFAULT_MODE === "paid" ? "paid" : "free";
 
@@ -22,11 +24,14 @@ const EXAMPLES = [
 export default function Home() {
   const [text, setText] = useState("");
   const [image, setImage] = useState<string | null>(null);
+  const [audio, setAudio] = useState<{ url: string; name: string } | null>(null);
   const [mode, setMode] = useState<Mode>(DEFAULT_MODE);
   const [forceFallback, setForceFallback] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stage, setStage] = useState<{ key: string; label: string } | null>(null);
+  const [liveOpinions, setLiveOpinions] = useState<ModelOpinion[]>([]);
 
   function onPickImage(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -40,24 +45,61 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
+  function onPickAudio(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setError("Audio too large (max 10 MB).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setAudio({ url: reader.result as string, name: file.name });
+    reader.readAsDataURL(file);
+  }
+
   async function run() {
-    if ((!text.trim() && !image) || loading) return;
+    if ((!text.trim() && !image && !audio) || loading) return;
     setLoading(true);
     setError(null);
     setResult(null);
+    setStage(null);
+    setLiveOpinions([]);
     try {
-      const res = await fetch("/api/analyze", {
+      const res = await fetch("/api/analyze/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, mode, forceFallback, image }),
+        body: JSON.stringify({ text, mode, forceFallback, image, audio: audio?.url }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Something went wrong.");
-      setResult(data as AnalysisResult);
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? "Something went wrong.");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+        for (const block of blocks) {
+          const line = block.trim();
+          if (!line.startsWith("data:")) continue;
+          const ev = JSON.parse(line.slice(5).trim()) as StreamEvent;
+          if (ev.type === "stage") setStage({ key: ev.stage, label: ev.label });
+          else if (ev.type === "opinion") setLiveOpinions((prev) => [...prev, ev.opinion]);
+          else if (ev.type === "result") setResult(ev.result);
+          else if (ev.type === "error") setError(ev.message);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
       setLoading(false);
+      setStage(null);
     }
   }
 
@@ -116,6 +158,10 @@ export default function Home() {
             📷 Upload screenshot
             <input type="file" accept="image/*" onChange={onPickImage} className="hidden" />
           </label>
+          <label className="mono cursor-pointer rounded-full border border-border bg-card px-3 py-1 text-[11px] text-muted hover:border-primary/50 hover:text-foreground">
+            🎙 Voice note
+            <input type="file" accept="audio/*" onChange={onPickAudio} className="hidden" />
+          </label>
         </div>
 
         {image && (
@@ -125,6 +171,19 @@ export default function Home() {
             <span className="text-xs text-muted">Screenshot attached — Mesh vision will read it.</span>
             <button
               onClick={() => setImage(null)}
+              className="mono ml-auto rounded px-2 py-1 text-[11px] text-danger hover:bg-danger/10"
+            >
+              remove
+            </button>
+          </div>
+        )}
+
+        {audio && (
+          <div className="mt-3 flex items-center gap-3 rounded-xl border border-border bg-card p-2.5">
+            <span className="text-lg">🎙</span>
+            <span className="truncate text-xs text-muted">{audio.name} — Mesh will transcribe (Indian languages).</span>
+            <button
+              onClick={() => setAudio(null)}
               className="mono ml-auto rounded px-2 py-1 text-[11px] text-danger hover:bg-danger/10"
             >
               remove
@@ -144,7 +203,7 @@ export default function Home() {
           </label>
           <button
             onClick={run}
-            disabled={loading || (!text.trim() && !image)}
+            disabled={loading || (!text.trim() && !image && !audio)}
             className="inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {loading ? "Checking…" : "Check message"}
@@ -159,14 +218,10 @@ export default function Home() {
         </div>
       )}
 
-      {/* Loading skeleton */}
+      {/* Live pipeline progress */}
       {loading && (
-        <div className="mt-8 space-y-3">
-          <div className="h-32 animate-pulse rounded-2xl border border-border bg-card" />
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="h-40 animate-pulse rounded-2xl border border-border bg-card" />
-            <div className="h-40 animate-pulse rounded-2xl border border-border bg-card" />
-          </div>
+        <div className="mt-8">
+          <StreamProgress activeStage={stage?.key ?? null} stageLabel={stage?.label ?? null} opinions={liveOpinions} />
         </div>
       )}
 
@@ -176,15 +231,16 @@ export default function Home() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <MeshFeatures features={result.mesh_features} />
             <div className="flex items-center gap-2">
-              {result.source === "image" && (
+              {result.source !== "text" && (
                 <span className="mono rounded-full border border-border px-2.5 py-0.5 text-[10px] text-muted">
-                  read from screenshot
+                  {result.source === "image" ? "read from screenshot" : "transcribed from voice note"}
                 </span>
               )}
               <ListenButton
                 text={`${result.verdict.headline}. ${result.verdict.explanation}`}
                 lang={result.signal.language}
               />
+              <ShareButton result={result} />
             </div>
           </div>
           <VerdictCard verdict={result.verdict} />
