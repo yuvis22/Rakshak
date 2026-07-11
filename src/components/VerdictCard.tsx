@@ -1,13 +1,16 @@
 import type { Verdict } from "@/lib/types";
 import { riskMeta } from "@/lib/ui";
 
-export function VerdictCard({ verdict }: { verdict: Verdict }) {
+export function VerdictCard({ verdict, label }: { verdict: Verdict; label?: string }) {
   const meta = riskMeta[verdict.risk_level];
   return (
     <div
       className="rise rounded-2xl p-6 sm:p-7"
       style={{ background: meta.bg, border: `1px solid ${meta.border}` }}
     >
+      {label && (
+        <div className="mono mb-3 text-[11px] uppercase tracking-wider text-muted">{label}</div>
+      )}
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-center gap-3">
           <span
