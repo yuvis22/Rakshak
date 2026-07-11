@@ -1,59 +1,35 @@
-import type { Mode } from "@/lib/types";
-
 /**
- * A resolved set of models for one analysis run.
- * The same shape is used for both free and paid modes so the pipeline
- * code never branches on mode — only the model IDs change.
+ * The model line-up for a run. It carries BOTH tiers (cheap + premium) so the
+ * pipeline can start cheap and escalate to premium only when the check is hard
+ * or high-stakes — automatic cost optimization, no user-facing modes.
  */
 export interface ModelPlan {
-  mode: Mode;
-  extractor: string; // structured extraction (needs structured-output support)
-  triage: string; // cheap first-pass classifier ("cheapest that works")
-  escalation: string; // strong model for sensitive/financial cases
-  consensus: string[]; // 2-4 models fanned out for the verdict panel
-  aggregator: string; // synthesizes the final verdict from opinions
-  vision: string; // multimodal model for screenshot/image input
-  dynamic: boolean; // true if resolved live from /v1/models/free
+  extractor: string; // cheap structured-output model for signal extraction
+  triage: string; // Mesh auto-routed triage pass
+  cheapConsensus: string[]; // fast, low-cost models for the first pass
+  premiumConsensus: string[]; // heavyweight models used only on escalation
+  cheapAggregator: string; // cheap synthesiser
+  premiumAggregator: string; // premium synthesiser (on escalation)
+  vision: string; // multimodal model for screenshots
+  dynamic: boolean;
 }
 
 /**
- * PAID mode: recognizable heavyweight models. This is the lineup that makes
- * the multi-model consensus panel impressive for the demo video.
- * Extractor/aggregator use structured-output-capable models (verified via the
- * `supports_structured_output` flag on GET /v1/models).
+ * Model tiers verified against GET /v1/models (supports_structured_output +
+ * live pricing). Cheap models cost fractions of a paisa; premium models are the
+ * recognizable heavyweights that make the consensus panel compelling.
  */
-export const PAID_PLAN: ModelPlan = {
-  mode: "paid",
-  extractor: "google/gemini-2.5-flash", // struct=true
-  triage: "openai/gpt-4o-mini",
-  escalation: "anthropic/claude-haiku-4.5", // struct=true
-  consensus: ["openai/gpt-4o", "anthropic/claude-haiku-4.5", "google/gemini-2.5-flash"],
-  aggregator: "openai/gpt-5", // struct=true
-  vision: "openai/gpt-4o", // image input
-  dynamic: false,
-};
-
-/**
- * FREE mode = lowest-cost line-up. NOTE: this Mesh account exposes no truly
- * zero-cost models (GET /v1/models/free is empty), so "free" here means the
- * cheapest available models — fractions of a paisa per call. If real free
- * models ever appear, resolvePlan() will discover and prefer them automatically.
- */
-export const FREE_PLAN_DEFAULTS: ModelPlan = {
-  mode: "free",
+export const PLAN: ModelPlan = {
   extractor: "google/gemini-2.5-flash-lite", // struct=true, ~$0.0001/1k
   triage: "meta-llama/meta-llama-3.1-8b-instruct", // ~$0.00002/1k
-  escalation: "google/gemini-2.5-flash", // struct=true
-  consensus: [
-    "meta-llama/meta-llama-3.1-8b-instruct",
-    "mistralai/mistral-nemo",
-    "google/gemini-2.5-flash-lite",
-  ],
-  aggregator: "google/gemini-2.5-flash-lite", // struct=true
+  cheapConsensus: ["mistralai/mistral-nemo", "google/gemini-2.5-flash-lite"], // fast + 2 providers
+  premiumConsensus: ["openai/gpt-4o", "anthropic/claude-haiku-4.5"],
+  cheapAggregator: "google/gemini-2.5-flash-lite", // struct=true
+  premiumAggregator: "google/gemini-2.5-flash", // struct=true, fast + capable
   vision: "google/gemini-2.5-flash", // image input, cheap
   dynamic: false,
 };
 
-export function basePlan(mode: Mode): ModelPlan {
-  return mode === "paid" ? { ...PAID_PLAN } : { ...FREE_PLAN_DEFAULTS };
+export function basePlan(): ModelPlan {
+  return { ...PLAN };
 }

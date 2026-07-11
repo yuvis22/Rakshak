@@ -22,10 +22,17 @@ export function OrchestrationPanel({ result }: { result: AnalysisResult }) {
         />
         <Cell
           label="Routing"
-          value={routing.escalated ? "escalated → strong model" : "low-cost route"}
+          value={routing.escalated ? "escalated to premium" : "cheap-first (no escalation)"}
           accent={routing.escalated}
         />
       </div>
+
+      {routing.escalated && routing.escalation_reason && (
+        <div className="mono mt-3 rounded-lg border border-warn/30 bg-warn/10 p-2.5 text-[11px] text-warn">
+          ↑ Escalated because: {routing.escalation_reason}
+          {routing.router_selected ? ` · Mesh router picked ${routing.router_selected}` : ""}
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <Chip on={signal.contains_sensitive_request} label="secret requested" />
@@ -45,7 +52,7 @@ export function OrchestrationPanel({ result }: { result: AnalysisResult }) {
           {usage.length} model call(s) · {total_latency_ms}ms
         </span>
         <span className="mono text-[11px] text-muted">
-          {mock ? "₹0 · offline engine" : result.mode === "free" ? "lowest-cost models" : "premium models"}
+          {mock ? "₹0 · offline engine" : routing.tier === "cheap" ? "cheap models only" : "escalated to premium"}
         </span>
       </div>
     </div>

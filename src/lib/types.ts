@@ -1,7 +1,6 @@
 import { z } from "zod";
 
-/** Free = zero-cost models (dev/testing). Paid = premium models (best results / demo). */
-export type Mode = "free" | "paid";
+
 
 /** Structured signal extracted from a raw message before we judge it. */
 export const ScamSignalSchema = z.object({
@@ -14,6 +13,13 @@ export const ScamSignalSchema = z.object({
   amount: z.string().describe("Any money amount mentioned, else empty string"),
   urgency: z.enum(["none", "low", "medium", "high"]).describe("How much pressure/urgency the message creates"),
   ask: z.string().describe("What the message wants the user to do"),
+  intent: z
+    .enum(["delivers_otp", "requests_secret", "requests_money", "requests_action", "informational", "unknown"])
+    .describe(
+      "The message's intent. 'delivers_otp' = it is SENDING a code/OTP to the user (usually legitimate). " +
+        "'requests_secret' = it ASKS the user to share/enter an OTP/PIN/password/card (scam). " +
+        "'requests_money' = asks to pay/transfer. 'requests_action' = click/call/install. 'informational' = no ask.",
+    ),
   threat_category: z
     .enum([
       "financial",
@@ -29,7 +35,10 @@ export const ScamSignalSchema = z.object({
     .describe("Best-guess category of the potential threat"),
   contains_sensitive_request: z
     .boolean()
-    .describe("True if it asks for OTP, password, bank/card details, or money transfer"),
+    .describe(
+      "True ONLY if the message ASKS the user to share/enter a secret (OTP/PIN/password/card). " +
+        "A message that merely DELIVERS an OTP to the user is NOT a sensitive request — set this false.",
+    ),
 });
 export type ScamSignal = z.infer<typeof ScamSignalSchema>;
 
@@ -46,6 +55,37 @@ export const ModelOpinionSchema = z.object({
   error: z.string().nullable().optional(),
 });
 export type ModelOpinion = z.infer<typeof ModelOpinionSchema>;
+
+/** A context question Rakshak asks the user to refine an ambiguous verdict. */
+export interface FollowUpQuestion {
+  id: string;
+  question: string;
+  hint?: string;
+  risky_answer: "yes" | "no"; // the answer that raises risk
+  weight: number; // score delta applied on the risky answer
+}
+
+/**
+ * A user's answer to a follow-up question. Carries the question metadata so
+ * re-assessment works even when questions were AI-generated per message
+ * (no need to regenerate/match by id).
+ */
+export interface QuestionAnswer {
+  id: string;
+  answer: "yes" | "no" | "unsure";
+  question?: string;
+  risky_answer?: "yes" | "no";
+  weight?: number;
+}
+
+/** One answered turn in the multi-turn context conversation. */
+export interface ConversationTurn {
+  id: string;
+  question: string;
+  answer: "yes" | "no" | "unsure";
+  risky_answer?: "yes" | "no";
+  weight?: number;
+}
 
 /** The final synthesized verdict shown to the user. */
 export const VerdictSchema = z.object({
@@ -90,6 +130,11 @@ export interface UsageEvent {
   cost_usd: number | null;
 }
 
+/** Response of a conversation round: ask a batch of questions, or decide. */
+export type ConverseResponse =
+  | { action: "ask"; questions: FollowUpQuestion[]; round: number; note?: string }
+  | { action: "decide"; verdict: Verdict; applied: string[]; round: number };
+
 /** Server-sent events emitted while an analysis runs (streaming endpoint). */
 export type StreamEvent =
   | { type: "stage"; stage: string; label: string }
@@ -99,10 +144,11 @@ export type StreamEvent =
 
 /** Full analysis response returned by /api/analyze. */
 export interface AnalysisResult {
-  mode: Mode;
   mock: boolean;
   source: "text" | "image" | "audio"; // text, screenshot (vision), or voice note (STT)
+  analyzed_text: string; // the text actually analysed (post-transcription for media)
   signal: ScamSignal;
+  questions: FollowUpQuestion[]; // context questions to refine the verdict
   matches: ScamMatch[];
   retrieval: RetrievalInfo;
   intel: WebIntel | null;
@@ -112,6 +158,9 @@ export interface AnalysisResult {
     triage_model: string;
     triage_auto_routed: boolean; // true when Mesh Auto-Router chose the model
     escalated: boolean;
+    escalation_reason?: string; // why we escalated to premium models
+    tier: "cheap" | "premium" | "mixed"; // which model tier(s) served this check
+    router_selected?: string; // model chosen by Mesh /v1/router/select on escalation
     resolved_models: string[];
     fallback_used: boolean;
     fallback_note?: string;

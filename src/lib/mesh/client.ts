@@ -165,6 +165,82 @@ export async function compare(params: {
   };
 }
 
+/**
+ * Streaming multi-model compare. Uses Mesh's native SSE fan-out
+ * (skip_comparison mode): each model streams tokens tagged by name, and we
+ * finalise a per-model result on `model_stream_done`, invoking `onModel`.
+ */
+export async function compareStream(
+  params: { models: string[]; messages: ChatMessage[]; temperature?: number },
+  onModel: (r: CompareModelResult) => void,
+): Promise<{ partial: boolean }> {
+  const res = await fetch(`${BASE_URL}/chat/compare`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      models: params.models,
+      messages: params.messages,
+      temperature: params.temperature ?? 0,
+      skip_comparison: true,
+      stream: true,
+    }),
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => "");
+    throw new MeshError(res.status, text || res.statusText);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const buffers = new Map<string, string>();
+  const started = Date.now();
+  let partial = false;
+  let sseBuf = "";
+
+  const handle = (event: string, dataStr: string) => {
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(dataStr);
+    } catch {
+      return;
+    }
+    const model = data.model as string | undefined;
+    if (event === "model_chunk" && model) {
+      buffers.set(model, (buffers.get(model) ?? "") + ((data.delta as string) ?? ""));
+    } else if (event === "model_stream_done" && model) {
+      const err = (data.error as string | null) ?? null;
+      if (err) partial = true;
+      onModel({
+        model,
+        content: buffers.get(model) ?? "",
+        latency_ms: Date.now() - started,
+        error: err,
+        usage: data.usage as Record<string, unknown> | undefined,
+      });
+    } else if (event === "done") {
+      if (data.partial) partial = true;
+    }
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    sseBuf += decoder.decode(value, { stream: true });
+    const blocks = sseBuf.split("\n\n");
+    sseBuf = blocks.pop() ?? "";
+    for (const block of blocks) {
+      let event = "message";
+      let dataStr = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+      }
+      if (dataStr) handle(event, dataStr);
+    }
+  }
+  return { partial };
+}
+
 export interface MeshModel {
   id: string;
   name: string;
@@ -206,6 +282,42 @@ export async function listModels(freeOnly = false): Promise<MeshModel[]> {
   const data = await res.json();
   const arr = Array.isArray(data) ? data : (data?.data ?? []);
   return arr as MeshModel[];
+}
+
+export interface RouterSelection {
+  model: string;
+  reasoning_effort: "high" | "medium" | "low" | "none" | null;
+  fallback_used: boolean;
+}
+
+/**
+ * Mesh Router Select — resolves the Auto Router's best model for a prompt
+ * WITHOUT running inference. We use it to pick the escalation model (and read
+ * its reasoning_effort as a complexity hint) for cost-aware routing.
+ */
+export async function routerSelect(params: {
+  messages: ChatMessage[];
+  exclude_models?: string[];
+}): Promise<RouterSelection> {
+  const res = await fetch(`${BASE_URL}/router/select`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      messages: params.messages,
+      api_type: "completions",
+      ...(params.exclude_models ? { exclude_models: params.exclude_models } : {}),
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new MeshError(res.status, text || res.statusText);
+  }
+  const data = await res.json();
+  return {
+    model: data?.model ?? "",
+    reasoning_effort: data?.reasoning_effort ?? null,
+    fallback_used: Boolean(data?.auto_router?.fallback_used),
+  };
 }
 
 export interface WebSearchResult {
@@ -282,7 +394,7 @@ export async function speak(params: {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
-      model: params.model ?? "eleven_flash_v2_5",
+      model: params.model ?? "elevenlabs/eleven_flash_v2_5",
       input: params.input,
       voice: params.voice ?? "JBFqnCBsd6RMkjVDRZzb",
       stream: false,
