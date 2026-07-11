@@ -63,28 +63,28 @@ Verdict + model opinions + routing metadata + Mesh features used
 
 ```mermaid
 flowchart TD
-    UI[page.tsx] -->|POST SSE| Stream[/api/analyze/stream]
-    Stream --> Pipeline[pipeline.ts]
+    UI["page.tsx"] -->|POST SSE| Stream["api/analyze/stream"]
+    Stream --> Pipeline["pipeline.ts"]
 
-    Pipeline --> Media{Image / Audio?}
-    Media -->|Yes| Transcribe[Vision / Sarvam STT]
-    Media -->|No| Extract
-    Transcribe --> Extract[Signal extraction]
+    Pipeline --> Media{"Image or Audio?"}
+    Media -->|Yes| Transcribe["Vision + Sarvam STT"]
+    Media -->|No| Extract["Signal extraction"]
+    Transcribe --> Extract
 
-    Extract --> RAG[Scam pattern retrieval]
-    Extract --> Triage[Mesh auto-router]
-    Extract --> Intel[Web search intel]
+    Extract --> RAG["Scam pattern retrieval"]
+    Extract --> Triage["Mesh auto-router"]
+    Extract --> Intel["Web search intel"]
 
-    RAG --> Consensus[Cheap model consensus]
-    Consensus --> Escalate{High stakes / disagree?}
-    Escalate -->|Yes| Premium[Premium model consensus]
-    Escalate -->|No| Synthesize
-    Premium --> Synthesize[Final verdict synthesis]
+    RAG --> Consensus["Cheap model consensus"]
+    Consensus --> Escalate{"High stakes or disagree?"}
+    Escalate -->|Yes| Premium["Premium model consensus"]
+    Escalate -->|No| Synthesize["Final verdict synthesis"]
+    Premium --> Synthesize
 
-    Synthesize --> Result[AnalysisResult]
+    Synthesize --> Result["AnalysisResult"]
     Result --> UI
 
-    UI --> Converse[/api/converse]
+    UI --> Converse["api/converse"]
     Converse --> Pipeline
 ```
 
