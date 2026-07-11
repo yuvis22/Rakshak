@@ -1,5 +1,5 @@
 import { analyze } from "@/lib/mesh/pipeline";
-import type { Mode, StreamEvent } from "@/lib/types";
+import type { StreamEvent } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
  * final `result` event with the full AnalysisResult.
  */
 export async function POST(req: Request) {
-  let body: { text?: string; mode?: Mode; forceFallback?: boolean; image?: string; audio?: string };
+  let body: { text?: string; forceFallback?: boolean; image?: string; audio?: string };
   try {
     body = await req.json();
   } catch {
@@ -20,7 +20,6 @@ export async function POST(req: Request) {
   const text = (body.text ?? "").trim();
   const image = typeof body.image === "string" && body.image.startsWith("data:image/") ? body.image : undefined;
   const audio = typeof body.audio === "string" && body.audio.startsWith("data:audio/") ? body.audio : undefined;
-  const mode: Mode = body.mode === "paid" ? "paid" : "free";
 
   if (!text && !image && !audio) {
     return new Response("Nothing to analyse", { status: 400 });
@@ -37,7 +36,7 @@ export async function POST(req: Request) {
         }
       };
       try {
-        const result = await analyze(text, mode, {
+        const result = await analyze(text, {
           forceFallback: Boolean(body.forceFallback),
           image,
           audio,

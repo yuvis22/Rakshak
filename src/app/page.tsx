@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { AnalysisResult, Mode, ModelOpinion, StreamEvent } from "@/lib/types";
+import type { AnalysisResult, ModelOpinion, StreamEvent } from "@/lib/types";
 import { StreamProgress } from "@/components/StreamProgress";
 import { VerdictCard } from "@/components/VerdictCard";
 import { ModelPanel } from "@/components/ModelPanel";
@@ -11,8 +11,8 @@ import { IntelPanel } from "@/components/IntelPanel";
 import { MeshFeatures } from "@/components/MeshFeatures";
 import { ListenButton } from "@/components/ListenButton";
 import { ShareButton } from "@/components/ShareButton";
-
-const DEFAULT_MODE: Mode = process.env.NEXT_PUBLIC_DEFAULT_MODE === "paid" ? "paid" : "free";
+import { ReportButton } from "@/components/ReportButton";
+import { Conversation } from "@/components/Conversation";
 
 const EXAMPLES = [
   "Dear customer, your SBI account will be BLOCKED today. Complete KYC now: http://sbi-kyc-verify.link/update Share OTP to confirm.",
@@ -25,7 +25,6 @@ export default function Home() {
   const [text, setText] = useState("");
   const [image, setImage] = useState<string | null>(null);
   const [audio, setAudio] = useState<{ url: string; name: string } | null>(null);
-  const [mode, setMode] = useState<Mode>(DEFAULT_MODE);
   const [forceFallback, setForceFallback] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -68,7 +67,7 @@ export default function Home() {
       const res = await fetch("/api/analyze/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, mode, forceFallback, image, audio: audio?.url }),
+        body: JSON.stringify({ text, forceFallback, image, audio: audio?.url }),
       });
       if (!res.ok || !res.body) {
         const data = await res.json().catch(() => ({}));
@@ -116,7 +115,7 @@ export default function Home() {
             <div className="mono text-[10px] uppercase tracking-[0.2em] text-muted">scam shield</div>
           </div>
         </div>
-        <ModeToggle mode={mode} setMode={setMode} />
+        <span className="mono text-[10px] uppercase tracking-wider text-muted">Mesh Hackathon 2026</span>
       </header>
 
       {/* Hero */}
@@ -241,9 +240,11 @@ export default function Home() {
                 lang={result.signal.language}
               />
               <ShareButton result={result} />
+              {result.verdict.risk_level !== "safe" && <ReportButton result={result} />}
             </div>
           </div>
           <VerdictCard verdict={result.verdict} />
+          <Conversation result={result} />
           <MatchPanel matches={result.matches} retrieval={result.retrieval} />
           {result.intel && <IntelPanel intel={result.intel} />}
           <div className="grid gap-4 sm:grid-cols-2">
@@ -265,24 +266,5 @@ export default function Home() {
         </p>
       </footer>
     </main>
-  );
-}
-
-function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
-  return (
-    <div className="flex items-center gap-1 rounded-full border border-border bg-card p-1">
-      {(["free", "paid"] as Mode[]).map((m) => (
-        <button
-          key={m}
-          onClick={() => setMode(m)}
-          className={`mono rounded-full px-3 py-1 text-[11px] uppercase tracking-wider transition-colors ${
-            mode === m ? "bg-primary text-background" : "text-muted hover:text-foreground"
-          }`}
-          title={m === "free" ? "Lowest-cost models for dev/testing" : "Premium models for best results"}
-        >
-          {m}
-        </button>
-      ))}
-    </div>
   );
 }

@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 import { analyze } from "@/lib/mesh/pipeline";
-import type { Mode } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  let body: { text?: string; mode?: Mode; forceFallback?: boolean; image?: string; audio?: string };
+  let body: { text?: string; forceFallback?: boolean; image?: string; audio?: string };
   try {
     body = await req.json();
   } catch {
@@ -24,10 +23,8 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Message too long (max 8000 characters)." }, { status: 400 });
   }
 
-  const mode: Mode = body.mode === "paid" ? "paid" : "free";
-
   try {
-    const result = await analyze(text, mode, { forceFallback: Boolean(body.forceFallback), image, audio });
+    const result = await analyze(text, { forceFallback: Boolean(body.forceFallback), image, audio });
     return NextResponse.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Analysis failed.";

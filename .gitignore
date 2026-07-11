@@ -37,6 +37,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# runtime learned-scam store
+/data
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

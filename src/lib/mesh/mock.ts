@@ -1,6 +1,5 @@
 import type {
   AnalysisResult,
-  Mode,
   ModelOpinion,
   RiskLevel,
   ScamMatch,
@@ -11,6 +10,8 @@ import type {
 import { basePlan } from "./models";
 import { retrieve } from "@/lib/knowledge/retrieval";
 import { detectInjection } from "@/lib/security";
+import { applyAnswers, generateQuestions } from "@/lib/questions";
+import type { ConversationTurn, ConverseResponse, QuestionAnswer } from "@/lib/types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -36,28 +37,60 @@ function detectLanguage(text: string): string {
   return "English";
 }
 
+// Someone ASKING the user to hand over a secret (the real danger).
+const REQUEST_SECRET_RE =
+  /\b(share|send|tell|give|forward|enter|provide|read\s*out|submit|confirm|verify)\b[^.\n]{0,40}\b(otp|pin|cvv|password|code|card\s*(?:number|details)|upi\s*pin)\b/i;
+const REQUEST_SECRET_RE2 =
+  /\b(otp|pin|cvv|password|code)\b[^.\n]{0,25}\b(share|send|tell|forward|enter|submit|provide|read\s*out)\b/i;
+// A message that DELIVERS an OTP/code to the user (usually legitimate).
+const DELIVERS_OTP_RE = /\b\d{4,8}\b/;
+const OTP_CONTEXT_RE = /\b(otp|one[-\s]?time|code|verification|password)\b/i;
+
+function classifyIntent(
+  text: string,
+  links: string[],
+  amount: string,
+): { intent: ScamSignal["intent"]; requestsSecret: boolean } {
+  const requestsSecret = REQUEST_SECRET_RE.test(text) || REQUEST_SECRET_RE2.test(text);
+  const deliversOtp = OTP_CONTEXT_RE.test(text) && DELIVERS_OTP_RE.test(text) && !requestsSecret;
+  const requestsMoney = /\b(pay|transfer|deposit|fee|recharge|send\s+money|remit)\b/i.test(text);
+  const requestsAction = links.length > 0 || /\b(click|call|install|download|update|verify|reactivate|apply)\b/i.test(text);
+
+  let intent: ScamSignal["intent"] = "unknown";
+  if (requestsSecret) intent = "requests_secret";
+  else if (deliversOtp) intent = "delivers_otp";
+  else if (requestsMoney || amount) intent = "requests_money";
+  else if (requestsAction) intent = "requests_action";
+  else intent = "informational";
+
+  return { intent, requestsSecret };
+}
+
 function buildSignal(text: string): ScamSignal {
   const lower = text.toLowerCase();
   const links = Array.from(text.matchAll(URL_RE)).map((m) => m[0]);
   const amount = text.match(AMOUNT_RE)?.[0] ?? "";
   const hits = SCAM_TERMS.filter((t) => lower.includes(t));
-  const sensitive = /\b(otp|pin|password|cvv|card number|upi pin|share code)\b/i.test(text);
+  const { intent, requestsSecret } = classifyIntent(text, links, amount);
 
   let category: ScamSignal["threat_category"] = "none";
-  if (/\b(otp|pin|cvv|password)\b/i.test(text)) category = "otp_theft";
+  if (requestsSecret) category = "otp_theft";
   else if (/\b(won|lottery|prize|lucky|reward)\b/i.test(text)) category = "lottery_prize";
   else if (/\b(loan|credit|emi)\b/i.test(text)) category = "job_loan_scam";
   else if (links.length && /\b(verify|kyc|update|blocked|click)\b/i.test(text)) category = "phishing";
-  else if (amount || /\b(refund|cashback|transfer|upi)\b/i.test(text)) category = "financial";
+  else if (intent === "requests_money" || /\b(refund|cashback|transfer|upi)\b/i.test(text)) category = "financial";
 
+  // A pure OTP delivery with no link/threat is not urgent by itself.
   const urgency: ScamSignal["urgency"] =
-    /\b(urgent|immediately|now|expire|24 hours|blocked|suspend)\b/i.test(text)
-      ? "high"
-      : hits.length > 2
-        ? "medium"
-        : hits.length > 0
-          ? "low"
-          : "none";
+    intent === "delivers_otp"
+      ? "none"
+      : /\b(urgent|immediately|now|expire|24 hours|blocked|suspend)\b/i.test(text)
+        ? "high"
+        : hits.length > 2
+          ? "medium"
+          : hits.length > 0
+            ? "low"
+            : "none";
 
   return {
     message_type: /@/.test(text) ? "email" : links.length ? "sms" : "whatsapp",
@@ -66,15 +99,35 @@ function buildSignal(text: string): ScamSignal {
     links,
     amount,
     urgency,
-    ask: hits.length ? `Message pushes you to: ${hits.slice(0, 3).join(", ")}` : "No clear ask detected",
+    ask:
+      intent === "delivers_otp"
+        ? "Delivers a one-time code to you"
+        : hits.length
+          ? `Message pushes you to: ${hits.slice(0, 3).join(", ")}`
+          : "No clear ask detected",
+    intent,
     threat_category: category,
-    contains_sensitive_request: sensitive,
+    contains_sensitive_request: requestsSecret,
   };
 }
 
 function scoreRisk(signal: ScamSignal, text: string): { level: RiskLevel; score: number; flags: string[] } {
   const flags: string[] = [];
   let score = 0;
+
+  // Genuine OTP delivery (a code sent TO you, no link, no request to share it)
+  // is safe by itself — the risk is only if you share it. Don't false-flag it.
+  if (signal.intent === "delivers_otp" && signal.links.length === 0) {
+    return {
+      level: "safe",
+      score: 15,
+      flags: [
+        "This looks like a genuine one-time code sent to you — safe by itself.",
+        "NEVER share this code with anyone. No bank, company, or 'agent' will ever ask for it.",
+      ],
+    };
+  }
+
   if (signal.contains_sensitive_request) {
     score += 45;
     flags.push("Asks for a secret (OTP / PIN / password / card) — no legitimate org ever does this.");
@@ -148,7 +201,6 @@ const MOCK_MODELS = ["mock/fast-8b", "mock/reasoner", "mock/multilingual"];
 
 export async function mockAnalyze(
   text: string,
-  mode: Mode,
   emit?: (ev: StreamEvent) => void,
 ): Promise<AnalysisResult> {
   const started = Date.now();
@@ -168,15 +220,19 @@ export async function mockAnalyze(
   await stage("route", "Selecting triage model…", 200);
   await stage("extract", "Extracting structured signal…", 220);
 
+  // A genuine OTP delivery (code sent TO you, no link, not asked to share) is
+  // safe by itself — don't let a lexical RAG match push it to "scam".
+  const benignOtp = signal.intent === "delivers_otp" && signal.links.length === 0 && !signal.contains_sensitive_request;
+
   const base = scoreRisk(signal, text);
-  const ragBoost = topMatch ? Math.round((topMatch.similarity / 100) * 40) : 0;
+  const ragBoost = benignOtp || !topMatch ? 0 : Math.round((topMatch.similarity / 100) * 40);
   let score = Math.min(98, base.score + ragBoost);
   // A strong match to a known, currently-active scam is itself a decisive signal.
-  if (topMatch && topMatch.similarity >= 70 && topMatch.status !== "classic") {
+  if (!benignOtp && topMatch && topMatch.similarity >= 70 && topMatch.status !== "classic") {
     score = Math.max(score, 68);
   }
   const flags = [...base.flags];
-  if (topMatch && topMatch.similarity >= 40) {
+  if (!benignOtp && topMatch && topMatch.similarity >= 40) {
     flags.unshift(`Matches a known "${topMatch.name}" (${topMatch.similarity}% similar to reported cases).`);
   }
   if (detectInjection(text)) {
@@ -213,12 +269,14 @@ export async function mockAnalyze(
     verdict.explanation += ` This closely resembles the "${topMatch.name}" pattern. ${topMatch.advice}`;
   }
 
-  const plan = basePlan(mode);
+  const plan = basePlan();
+  const escalated = signal.contains_sensitive_request || signal.threat_category === "financial";
   return {
-    mode,
     mock: true,
     source: "text",
+    analyzed_text: text,
     signal,
+    questions: generateQuestions(signal),
     matches: retrieval.matches,
     retrieval: retrieval.info,
     intel: null,
@@ -227,7 +285,9 @@ export async function mockAnalyze(
     routing: {
       triage_model: plan.triage,
       triage_auto_routed: false,
-      escalated: signal.contains_sensitive_request || signal.threat_category === "financial",
+      escalated,
+      escalation_reason: escalated ? "high-stakes content (money / secret)" : undefined,
+      tier: escalated ? "mixed" : "cheap",
       resolved_models: MOCK_MODELS,
       fallback_used: false,
     },
@@ -235,4 +295,46 @@ export async function mockAnalyze(
     total_latency_ms: Date.now() - started,
     mesh_features: retrieval.info.method === "embeddings" ? ["embeddings"] : [],
   };
+}
+
+/** Offline re-assessment: re-score the message using the user's context answers. */
+export function mockReassess(text: string, answers: QuestionAnswer[]): { verdict: Verdict; applied: string[] } {
+  const signal = buildSignal(text);
+  const base = scoreRisk(signal, text);
+  const { score, level, applied } = applyAnswers(base.score, answers);
+  const verdict = makeVerdict(signal, level, score, base.flags);
+  verdict.explanation = `Updated with your answers. ${verdict.explanation}`;
+  return { verdict, applied };
+}
+
+const MAX_ROUNDS = 3;
+const BATCH = 2;
+
+/** Offline multi-round conversation: ask a batch, and if still unsure, ask more. */
+export function mockConverse(text: string, history: ConversationTurn[], round: number): ConverseResponse {
+  const signal = buildSignal(text);
+  const pool = generateQuestions(signal);
+  const answered = new Set(history.map((h) => h.id));
+  const remaining = pool.filter((q) => !answered.has(q.id));
+
+  const base = scoreRisk(signal, text);
+  const interim = applyAnswers(base.score, history);
+  const decisive = interim.score < 25 || interim.score >= 70; // clearly safe or clearly scam
+
+  const mustDecide = round >= MAX_ROUNDS || remaining.length === 0 || decisive;
+  if (!mustDecide) {
+    return {
+      action: "ask",
+      questions: remaining.slice(0, BATCH),
+      round: round + 1,
+      note:
+        history.length > 0
+          ? `Still weighing it up (current read: ${interim.level}). A couple more details will help.`
+          : undefined,
+    };
+  }
+
+  const verdict = makeVerdict(signal, interim.level, interim.score, base.flags);
+  if (history.length > 0) verdict.explanation = `Based on your answers, ${verdict.explanation}`;
+  return { action: "decide", verdict, applied: interim.applied, round };
 }

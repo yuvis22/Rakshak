@@ -1,6 +1,5 @@
 import {
   type AnalysisResult,
-  type Mode,
   type ModelOpinion,
   ModelOpinionSchema,
   type RiskLevel,
@@ -9,13 +8,26 @@ import {
   type Verdict,
   VerdictSchema,
 } from "@/lib/types";
-import { chat, chatWithFallback, compare, isLive, MeshError, transcribe, webSearch, type ChatMessage } from "./client";
+import {
+  chat,
+  chatWithFallback,
+  compare,
+  compareStream,
+  isLive,
+  MeshError,
+  routerSelect,
+  transcribe,
+  webSearch,
+  type ChatMessage,
+} from "./client";
 import type { StreamEvent, WebIntel } from "@/lib/types";
 import { fenceUntrusted, INJECTION_GUARD } from "@/lib/security";
+import { generateQuestions } from "@/lib/questions";
+import type { ConversationTurn, ConverseResponse, FollowUpQuestion, QuestionAnswer } from "@/lib/types";
 
 /** Sarvam STT — optimised for Indian languages (Hindi, Hinglish, regional). */
 const STT_MODEL = "sarvam/saaras:v3";
-import { mockAnalyze } from "./mock";
+import { mockAnalyze, mockConverse, mockReassess } from "./mock";
 import { resolvePlan } from "./plan";
 import type { ModelPlan } from "./models";
 import { retrieve } from "@/lib/knowledge/retrieval";
@@ -32,13 +44,17 @@ const SIGNAL_SCHEMA = {
     amount: { type: "string" },
     urgency: { type: "string", enum: ["none", "low", "medium", "high"] },
     ask: { type: "string" },
+    intent: {
+      type: "string",
+      enum: ["delivers_otp", "requests_secret", "requests_money", "requests_action", "informational", "unknown"],
+    },
     threat_category: {
       type: "string",
       enum: ["financial", "phishing", "otp_theft", "lottery_prize", "job_loan_scam", "impersonation", "misinformation", "none", "other"],
     },
     contains_sensitive_request: { type: "boolean" },
   },
-  required: ["message_type", "sender", "language", "links", "amount", "urgency", "ask", "threat_category", "contains_sensitive_request"],
+  required: ["message_type", "sender", "language", "links", "amount", "urgency", "ask", "intent", "threat_category", "contains_sensitive_request"],
   additionalProperties: false,
 } as const;
 
@@ -56,7 +72,40 @@ const VERDICT_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+const CONVERSE_SCHEMA = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["ask", "decide"] },
+    note: { type: "string" },
+    questions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          question: { type: "string" },
+          hint: { type: "string" },
+          risky_answer: { type: "string", enum: ["yes", "no"] },
+          weight: { type: "number" },
+        },
+        required: ["id", "question", "risky_answer", "weight"],
+        additionalProperties: false,
+      },
+    },
+    verdict: VERDICT_SCHEMA,
+  },
+  required: ["action"],
+  additionalProperties: false,
+} as const;
+
 /* ---------- helpers ---------- */
+
+/** Normalise confidence to 0-100 (some models answer on a 0-1 scale). */
+function normConfidence(c: number): number {
+  if (!Number.isFinite(c)) return 50;
+  const v = c > 0 && c <= 1 ? c * 100 : c;
+  return Math.max(0, Math.min(100, Math.round(v)));
+}
 
 /** Pull the first JSON object out of a model response, tolerating prose/markdown fences. */
 function parseJson<T>(raw: string): T | null {
@@ -102,19 +151,79 @@ async function transcribeImage(dataUrl: string, plan: ModelPlan): Promise<string
   return res.content.trim();
 }
 
-/** Auto-Routing: let Mesh's router pick the model for a quick triage pass. */
-async function triageAuto(text: string): Promise<{ model: string; auto_routed: boolean }> {
+const QUESTIONS_SCHEMA = {
+  type: "object",
+  properties: {
+    questions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          question: { type: "string" },
+          hint: { type: "string" },
+          risky_answer: { type: "string", enum: ["yes", "no"] },
+          weight: { type: "number" },
+        },
+        required: ["id", "question", "risky_answer", "weight"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["questions"],
+  additionalProperties: false,
+} as const;
+
+/**
+ * AI-generated context questions, tailored to THIS message. Each question is a
+ * yes/no whose answer would most change the verdict, with a risky_answer and a
+ * weight (10-45) so offline re-scoring still works. Falls back to the heuristic
+ * bank if the model call fails.
+ */
+async function generateQuestionsLive(text: string, signal: ScamSignal, plan: ModelPlan): Promise<FollowUpQuestion[]> {
   try {
     const res = await chat({
-      model: "auto",
-      temperature: 0,
-      max_tokens: 20,
+      model: plan.extractor,
+      temperature: 0.2,
+      response_format: { type: "json_schema", json_schema: { name: "context_questions", schema: QUESTIONS_SCHEMA } },
       messages: [
-        { role: "system", content: "Classify this message's fraud risk in ONE word: safe, suspicious, or scam." },
-        { role: "user", content: text.slice(0, 1200) },
+        {
+          role: "system",
+          content:
+            "You are a fraud analyst. Generate 2-4 SHORT yes/no questions about the user's CONTEXT (not the message text) whose answers would most change whether this is a scam — e.g. did they initiate it, is someone pressuring them to share a code, is a remote-access app running, do they know the sender. " +
+            "Tailor the questions to THIS specific message. For each: set risky_answer to the answer indicating higher risk, and weight 10-45 by how decisive it is. Write in the user's language (" + signal.language + "). Return schema JSON. " +
+            INJECTION_GUARD,
+        },
+        { role: "user", content: `Signal:\n${JSON.stringify(signal)}\n\nMessage:\n${fenceUntrusted(text)}` },
       ],
     });
-    return { model: res.model, auto_routed: res.auto_routed };
+    const parsed = parseJson<{ questions: FollowUpQuestion[] }>(res.content);
+    const qs = (parsed?.questions ?? [])
+      .filter((q) => q && q.question && (q.risky_answer === "yes" || q.risky_answer === "no"))
+      .slice(0, 4)
+      .map((q, i) => ({
+        id: q.id || `q${i + 1}`,
+        question: String(q.question),
+        hint: q.hint ? String(q.hint) : undefined,
+        risky_answer: q.risky_answer,
+        weight: Math.max(5, Math.min(45, Number(q.weight) || 20)),
+      }));
+    if (qs.length > 0) return qs;
+  } catch {
+    /* fall back to heuristic */
+  }
+  return generateQuestions(signal);
+}
+
+/**
+ * Auto-Routing: ask Mesh's router which model best fits this message WITHOUT
+ * running inference (/v1/router/select). Fast (no tokens) and shows the router
+ * choice on every check.
+ */
+async function triageAuto(text: string): Promise<{ model: string; auto_routed: boolean }> {
+  try {
+    const sel = await routerSelect({ messages: [{ role: "user", content: text.slice(0, 1500) }] });
+    return { model: sel.model || "auto", auto_routed: Boolean(sel.model) };
   } catch {
     return { model: "auto (unavailable)", auto_routed: false };
   }
@@ -149,6 +258,7 @@ async function extractSignal(text: string, plan: ModelPlan): Promise<ScamSignal>
         role: "system",
         content:
           "You extract structured signals from a possibly-fraudulent message (SMS/WhatsApp/email) common in India. Reply ONLY with the schema JSON. Detect the language (English/Hindi/Hinglish). " +
+          "CRUCIAL: distinguish a message that DELIVERS an OTP/code to the user (intent 'delivers_otp', usually legitimate, contains_sensitive_request=false) from one that ASKS the user to share/enter an OTP/PIN/password/card (intent 'requests_secret', a scam, contains_sensitive_request=true). Merely containing the word 'OTP' or a code is NOT a scam by itself. " +
           INJECTION_GUARD,
       },
       { role: "user", content: fenceUntrusted(text) },
@@ -166,6 +276,7 @@ async function extractSignal(text: string, plan: ModelPlan): Promise<ScamSignal>
     amount: "",
     urgency: "none",
     ask: "unknown",
+    intent: "unknown",
     threat_category: "none",
     contains_sensitive_request: false,
   };
@@ -197,6 +308,7 @@ function toOpinion(model: string, content: string, latency?: number, error?: str
   }
   const parsed = parseJson<Partial<ModelOpinion>>(content);
   const candidate = { model, latency_ms: latency, error: null, ...parsed };
+  if (typeof candidate.confidence === "number") candidate.confidence = normConfidence(candidate.confidence);
   const safe = ModelOpinionSchema.safeParse(candidate);
   if (safe.success) return safe.data;
   return {
@@ -219,8 +331,23 @@ async function gatherOpinionsStreaming(
   models: string[],
   context: string,
   emit: (op: ModelOpinion) => void,
-): Promise<{ opinions: ModelOpinion[]; partial: boolean }> {
+): Promise<{ opinions: ModelOpinion[]; partial: boolean; usedCompare: boolean }> {
   const messages = opinionMessages(text, signal, context);
+
+  // Preferred path: Mesh native compare streaming (SSE fan-out).
+  try {
+    const opinions: ModelOpinion[] = [];
+    const { partial } = await compareStream({ models, messages, temperature: 0 }, (r) => {
+      const op = toOpinion(r.model, r.content, r.latency_ms, r.error);
+      opinions.push(op);
+      emit(op);
+    });
+    if (opinions.length > 0) return { opinions, partial, usedCompare: true };
+  } catch {
+    /* fall back to parallel single calls below */
+  }
+
+  // Fallback: fire each model individually in parallel, emit as they resolve.
   const opinions = await Promise.all(
     models.map(async (m) => {
       let op: ModelOpinion;
@@ -234,7 +361,7 @@ async function gatherOpinionsStreaming(
       return op;
     }),
   );
-  return { opinions, partial: opinions.some((o) => o.error) };
+  return { opinions, partial: opinions.some((o) => o.error), usedCompare: false };
 }
 
 async function gatherOpinions(
@@ -293,12 +420,12 @@ async function synthesize(
   text: string,
   signal: ScamSignal,
   opinions: ModelOpinion[],
-  plan: ModelPlan,
+  aggregator: string,
   context: string,
 ): Promise<Verdict> {
   try {
     const res = await chat({
-      model: plan.aggregator,
+      model: aggregator,
       temperature: 0,
       response_format: { type: "json_schema", json_schema: { name: "verdict", schema: VERDICT_SCHEMA } },
       messages: [
@@ -322,7 +449,7 @@ async function synthesize(
     });
     const parsed = parseJson<Verdict>(res.content);
     const safe = VerdictSchema.safeParse(parsed);
-    if (safe.success) return safe.data;
+    if (safe.success) return { ...safe.data, confidence: normConfidence(safe.data.confidence) };
   } catch {
     /* fall through to local aggregate */
   }
@@ -342,7 +469,7 @@ export interface AnalyzeOptions {
   emit?: (ev: StreamEvent) => void;
 }
 
-export async function analyze(text: string, mode: Mode, opts: AnalyzeOptions = {}): Promise<AnalysisResult> {
+export async function analyze(text: string, opts: AnalyzeOptions = {}): Promise<AnalysisResult> {
   const live = isLive() && process.env.MESH_FORCE_MOCK !== "1";
 
   // Screenshot / voice-note analysis needs live models — there's no offline OCR/STT.
@@ -354,17 +481,16 @@ export async function analyze(text: string, mode: Mode, opts: AnalyzeOptions = {
   }
 
   // No key configured, or explicit override → offline heuristic engine.
-  if (!live) return mockAnalyze(text, mode, opts.emit);
+  if (!live) return mockAnalyze(text, opts.emit);
 
   try {
-    return await analyzeLive(text, mode, opts);
+    return await analyzeLive(text, opts);
   } catch (err) {
-    // Graceful degradation: if the account has no balance (and Mesh exposes no
-    // free models), keep the app fully usable for dev/demo via the mock engine
-    // rather than surfacing a hard error.
+    // Graceful degradation: if the account has no balance, keep the app fully
+    // usable for dev/demo via the mock engine rather than a hard error.
     if (err instanceof MeshError && err.status === 402) {
       if (opts.image || opts.audio) throw err; // can't mock-analyse media
-      const fallback = await mockAnalyze(text, mode, opts.emit);
+      const fallback = await mockAnalyze(text, opts.emit);
       fallback.routing.fallback_note =
         "Mesh balance is ₹0 — ran the built-in offline engine. Top up ₹100 to use live models.";
       return fallback;
@@ -373,9 +499,9 @@ export async function analyze(text: string, mode: Mode, opts: AnalyzeOptions = {
   }
 }
 
-async function analyzeLive(inputText: string, mode: Mode, opts: AnalyzeOptions): Promise<AnalysisResult> {
+async function analyzeLive(inputText: string, opts: AnalyzeOptions): Promise<AnalysisResult> {
   const started = Date.now();
-  const plan = await resolvePlan(mode);
+  const plan = await resolvePlan();
   const meshFeatures = new Set<string>(["chat.completions", "structured-output"]);
   const emit = opts.emit;
   const stage = (s: string, label: string) => emit?.({ type: "stage", stage: s, label });
@@ -396,63 +522,126 @@ async function analyzeLive(inputText: string, mode: Mode, opts: AnalyzeOptions):
   }
 
   // RAG: retrieve the closest known scam patterns to ground the judgment.
-  stage("retrieve", "Matching against known scam patterns…");
-  const retrieval = await retrieve(text);
+  // Run the independent first steps in parallel: structured extraction, RAG
+  // retrieval and the auto-routed triage don't depend on one another.
+  stage("extract", "Extracting signal, matching patterns, routing…");
+  const [signal, retrieval, triage] = await Promise.all([
+    extractSignal(text, plan),
+    retrieve(text),
+    triageAuto(text),
+  ]);
   if (retrieval.info.method === "embeddings") meshFeatures.add("embeddings");
+  if (triage.auto_routed) {
+    meshFeatures.add("auto-routing");
+    meshFeatures.add("router-select");
+  }
+  const highStakes = needsEscalation(signal);
+  let escalated = false;
 
-  // Auto-Routing: quick triage pass where Mesh picks the model.
-  stage("route", "Auto-routing a triage model…");
-  const triage = await triageAuto(text);
-  if (triage.auto_routed) meshFeatures.add("auto-routing");
+  // Web Search: only when there's something concrete to check (link, named
+  // sender, or high-stakes). Run it in parallel with the cheap consensus so it
+  // never sits on the critical path.
+  const wantIntel =
+    signal.links.length > 0 || highStakes || !["none", "other"].includes(signal.threat_category);
+  const intelPromise: Promise<WebIntel | null> = wantIntel ? gatherIntel(signal, text) : Promise.resolve(null);
 
-  stage("extract", "Extracting structured signal…");
-  const signal = await extractSignal(text, plan);
-  const escalated = needsEscalation(signal);
-
-  // Web Search: live intel on the sender/link/claim.
-  stage("intel", "Searching the web for reported cases…");
-  const intel = await gatherIntel(signal, text);
-  if (intel) meshFeatures.add("web-search");
-  const context = intel?.answer
-    ? `${retrieval.context}\n\nLive web intel: ${intel.answer}`
-    : retrieval.context;
-  stage("consensus", "Asking multiple models in parallel…");
-
-  // Build the consensus line-up; escalate by adding the strong model for sensitive cases.
-  const models = Array.from(new Set(escalated ? [...plan.consensus, plan.escalation] : plan.consensus));
   let fallbackNote: string | undefined;
   let fallbackUsed = false;
 
-  // Fallback demo: prepend a deliberately-bad model, then rely on chatWithFallback-style resilience.
+  // Fallback demo: force a bad model first and rely on rerouting resilience.
   if (opts.forceFallback) {
     const badModel = "does-not-exist/offline-model";
     try {
-      await chatWithFallback([badModel, models[0]], {
-        messages: opinionMessages(text, signal, context),
+      await chatWithFallback([badModel, plan.cheapConsensus[0]], {
+        messages: opinionMessages(text, signal, retrieval.context),
         temperature: 0,
       });
       fallbackUsed = true;
-      fallbackNote = `Primary model failed; Mesh rerouted to ${models[0]} with zero downtime.`;
+      fallbackNote = `Primary model failed; Mesh rerouted to ${plan.cheapConsensus[0]} with zero downtime.`;
     } catch {
       /* ignore */
     }
   }
 
-  const { opinions, partial } = emit
-    ? await gatherOpinionsStreaming(text, signal, models, context, (op) => emit({ type: "opinion", opinion: op }))
-    : await gatherOpinions(text, signal, models, context);
-  if (emit) meshFeatures.add("chat.completions");
-  else meshFeatures.add("compare");
+  // Runs a consensus over a set of models (streaming or batched).
+  const runConsensus = async (models: string[], ctx: string) => {
+    if (emit) {
+      const r = await gatherOpinionsStreaming(text, signal, models, ctx, (op) => emit({ type: "opinion", opinion: op }));
+      meshFeatures.add(r.usedCompare ? "compare" : "chat.completions");
+      return r;
+    }
+    const r = await gatherOpinions(text, signal, models, ctx);
+    meshFeatures.add("compare");
+    return { ...r, usedCompare: true };
+  };
+
+  // ---- Cost optimization: cheap-first, escalate only when needed ----
+  stage("consensus", "Asking the fast, low-cost models first…");
+  const first = await runConsensus(plan.cheapConsensus, retrieval.context);
+  let opinions: ModelOpinion[] = first.opinions;
+  let partial = first.partial;
+
+  // Web-search intel was running in parallel; fold it into the synthesis context.
+  const intel = await intelPromise;
+  if (intel) meshFeatures.add("web-search");
+  const context = intel?.answer ? `${retrieval.context}\n\nLive web intel: ${intel.answer}` : retrieval.context;
+
+  const valid = opinions.filter((o) => !o.error);
+  const disagree = new Set(valid.map((o) => o.risk_level)).size > 1;
+  const avgConf = valid.length ? valid.reduce((s, o) => s + o.confidence, 0) / valid.length : 0;
+  const borderline = valid.some((o) => o.risk_level === "suspicious") || avgConf < 65;
+
+  const reasons: string[] = [];
+  if (highStakes) reasons.push("high-stakes content (money / secret / impersonation)");
+  if (disagree) reasons.push("the fast models disagreed");
+  if (borderline) reasons.push("borderline confidence");
+
+  let tier: "cheap" | "premium" | "mixed" = "cheap";
+  let escalationReason: string | undefined;
+  let routerSelected: string | undefined;
+  let aggregator = plan.cheapAggregator;
+
+  if (reasons.length > 0) {
+    escalated = true;
+    escalationReason = reasons.join(", ");
+    stage("escalate", `Escalating to premium models (${escalationReason})…`);
+
+    // Let Mesh's router pick the best escalation model (excluding the cheap ones).
+    let premiumModels = plan.premiumConsensus;
+    try {
+      const sel = await routerSelect({
+        messages: opinionMessages(text, signal, context),
+        exclude_models: plan.cheapConsensus,
+      });
+      meshFeatures.add("router-select");
+      if (sel.model) {
+        routerSelected = sel.model;
+        premiumModels = Array.from(new Set([sel.model, ...plan.premiumConsensus])).slice(0, 2);
+      }
+    } catch {
+      /* use the default premium pair */
+    }
+
+    const second = await runConsensus(premiumModels, context);
+    opinions = [...opinions, ...second.opinions];
+    partial = partial || second.partial;
+    tier = "mixed";
+    aggregator = plan.premiumAggregator;
+  }
   if (partial) fallbackUsed = true;
 
   stage("verdict", "Synthesizing the final verdict…");
-  const verdict = await synthesize(text, signal, opinions, plan, context);
+  const [verdict, questions] = await Promise.all([
+    synthesize(text, signal, opinions, aggregator, context),
+    generateQuestionsLive(text, signal, plan),
+  ]);
 
   return {
-    mode,
     mock: false,
     source,
+    analyzed_text: text,
     signal,
+    questions,
     matches: retrieval.matches,
     retrieval: retrieval.info,
     intel,
@@ -462,6 +651,9 @@ async function analyzeLive(inputText: string, mode: Mode, opts: AnalyzeOptions):
       triage_model: triage.model,
       triage_auto_routed: triage.auto_routed,
       escalated,
+      escalation_reason: escalationReason,
+      tier,
+      router_selected: routerSelected,
       resolved_models: opinions.map((o) => o.model),
       fallback_used: fallbackUsed,
       fallback_note: fallbackNote,
@@ -470,4 +662,148 @@ async function analyzeLive(inputText: string, mode: Mode, opts: AnalyzeOptions):
     total_latency_ms: Date.now() - started,
     mesh_features: Array.from(meshFeatures),
   };
+}
+
+/**
+ * Re-assess a message using the user's answers to context questions.
+ * These answers are decisive: e.g. "someone is asking me to read out the code"
+ * flips a genuine-looking OTP into a scam, while "I started this login myself"
+ * clears it. Live uses a model; offline/₹0 falls back to deterministic scoring.
+ */
+export async function reassess(
+  text: string,
+  answers: QuestionAnswer[],
+): Promise<{ verdict: Verdict; applied: string[] }> {
+  const live = isLive() && process.env.MESH_FORCE_MOCK !== "1";
+  if (!live) return mockReassess(text, answers);
+
+  try {
+    const plan = await resolvePlan();
+    const signal = await extractSignal(text, plan);
+    const qaLines = answers
+      .map((a) => `- ${a.question ?? a.id} → ${a.answer}`)
+      .join("\n");
+
+    const res = await chat({
+      model: plan.premiumAggregator,
+      temperature: 0,
+      response_format: { type: "json_schema", json_schema: { name: "verdict", schema: VERDICT_SCHEMA } },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a fraud analyst re-assessing a message using the user's answers to context questions. " +
+            "These answers are DECISIVE: if anyone is asking the user to share/read out/enter a code or secret, or a remote-access app is running, treat it as a scam even if the message looked benign. " +
+            "If the user started the action themselves and no one is pressuring them, a delivered OTP is safe. " +
+            "Return schema JSON in the user's language (" + signal.language + "). " +
+            INJECTION_GUARD,
+        },
+        {
+          role: "user",
+          content: `User's answers to context questions:\n${qaLines}\n\nSignal:\n${JSON.stringify(signal)}\n\nMessage:\n${fenceUntrusted(text)}`,
+        },
+      ],
+    });
+    const parsed = parseJson<Verdict>(res.content);
+    const safe = VerdictSchema.safeParse(parsed);
+    if (safe.success) {
+      return { verdict: { ...safe.data, confidence: normConfidence(safe.data.confidence) }, applied: qaLines.split("\n").filter(Boolean) };
+    }
+    return mockReassess(text, answers);
+  } catch (err) {
+    if (err instanceof MeshError && err.status === 402) return mockReassess(text, answers);
+    throw err;
+  }
+}
+
+const MAX_CONVERSE_ROUNDS = 3;
+
+/**
+ * Multi-round context conversation. Each round the model either asks a batch of
+ * new yes/no questions or, once confident (or after MAX rounds), decides with a
+ * final verdict. Offline/₹0 uses a deterministic multi-round heuristic.
+ */
+export async function converse(
+  text: string,
+  history: ConversationTurn[],
+  round: number,
+): Promise<ConverseResponse> {
+  const live = isLive() && process.env.MESH_FORCE_MOCK !== "1";
+  if (!live) return mockConverse(text, history, round);
+
+  try {
+    const plan = await resolvePlan();
+    const signal = await extractSignal(text, plan);
+    const mustDecide = round >= MAX_CONVERSE_ROUNDS || history.length >= 6;
+    const qa = history.length
+      ? history.map((h) => `- ${h.question} → ${h.answer}`).join("\n")
+      : "(none yet)";
+
+    const res = await chat({
+      model: plan.cheapAggregator,
+      temperature: 0.2,
+      response_format: { type: "json_schema", json_schema: { name: "converse", schema: CONVERSE_SCHEMA } },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are calmly interviewing a user to decide whether a message is a scam. " +
+            "Each round you may ASK a batch of 2-4 NEW yes/no context questions (about their situation — who contacted them, did they initiate it, is anyone pressuring them to share a code, is a remote-access app running, etc.), or DECIDE with a final verdict. " +
+            "Do NOT repeat questions already answered. Prefer to DECIDE as soon as the picture is clear. " +
+            `You have completed ${round} round(s).` +
+            (mustDecide ? " You MUST decide now — return action 'decide' with a verdict." : "") +
+            " For each question set risky_answer (answer implying higher risk) and weight 10-45. Write in the user's language (" +
+            signal.language +
+            "). Return schema JSON. " +
+            INJECTION_GUARD,
+        },
+        {
+          role: "user",
+          content: `Signal:\n${JSON.stringify(signal)}\n\nAnswers so far:\n${qa}\n\nMessage:\n${fenceUntrusted(text)}`,
+        },
+      ],
+    });
+
+    const parsed = parseJson<{
+      action?: string;
+      note?: string;
+      questions?: FollowUpQuestion[];
+      verdict?: Verdict;
+    }>(res.content);
+
+    if (!mustDecide && parsed?.action === "ask" && Array.isArray(parsed.questions) && parsed.questions.length) {
+      const answeredIds = new Set(history.map((h) => h.id));
+      const questions = parsed.questions
+        .filter((q) => q && q.question && (q.risky_answer === "yes" || q.risky_answer === "no"))
+        .map((q, i) => ({
+          id: q.id || `r${round}q${i + 1}`,
+          question: String(q.question),
+          hint: q.hint ? String(q.hint) : undefined,
+          risky_answer: q.risky_answer,
+          weight: Math.max(5, Math.min(45, Number(q.weight) || 20)),
+        }))
+        .filter((q) => !answeredIds.has(q.id))
+        .slice(0, 4);
+      if (questions.length) return { action: "ask", questions, round: round + 1, note: parsed.note };
+    }
+
+    if (parsed?.verdict) {
+      const safe = VerdictSchema.safeParse(parsed.verdict);
+      if (safe.success) {
+        return {
+          action: "decide",
+          verdict: { ...safe.data, confidence: normConfidence(safe.data.confidence) },
+          applied: history.map((h) => `${h.question} → ${h.answer}`),
+          round,
+        };
+      }
+    }
+
+    // Fallback: synthesise a decision from the answers.
+    const fb = await reassess(text, history);
+    return { action: "decide", verdict: fb.verdict, applied: fb.applied, round };
+  } catch (err) {
+    if (err instanceof MeshError && err.status === 402) return mockConverse(text, history, round);
+    throw err;
+  }
 }
