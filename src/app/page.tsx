@@ -128,7 +128,7 @@ export default function Home() {
         </h1>
         <p className="mt-3 max-w-xl text-[15px] leading-relaxed text-muted">
           Paste any suspicious SMS, WhatsApp forward, or email. Rakshak checks it across multiple AI
-          models in parallel through the Mesh API and tells you what to do.
+          models in parallel, then asks a few cross-questions about your situation to verify the verdict.
         </p>
       </section>
 
@@ -243,7 +243,10 @@ export default function Home() {
               {result.verdict.risk_level !== "safe" && <ReportButton result={result} />}
             </div>
           </div>
-          <VerdictCard verdict={result.verdict} />
+          <VerdictCard
+            verdict={result.verdict}
+            label={result.questions.length > 0 ? "Initial assessment — confirm below" : undefined}
+          />
           <Conversation result={result} />
           <MatchPanel matches={result.matches} retrieval={result.retrieval} />
           {result.intel && <IntelPanel intel={result.intel} />}
